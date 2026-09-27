@@ -10,6 +10,7 @@ class IngestionStatus:
     last_success_time: Optional[datetime.datetime] = None
     last_status: str = "never_run"
     error_message: Optional[str] = None
+    mode: str = "none"
 
 status = IngestionStatus()
 
@@ -18,16 +19,12 @@ def download_latest_gfs(lead_hour: int = 24) -> str:
     Downloads the latest GFS grib2 file for the specified lead time,
     subset to the India region and required variables.
     """
-    today = datetime.datetime.utcnow()
-    # GFS runs every 6 hours (00, 06, 12, 18). Find the most recent run.
+    # GFS takes ~3.5-4 hours after cycle time to publish. Offset time by 4 hours.
+    today = datetime.datetime.utcnow() - datetime.timedelta(hours=4)
     run_hour = (today.hour // 6) * 6
     date_str = today.strftime("%Y%m%d")
     
     # Required variables per contract: msl, 10u, 10v, 2t, tp
-    # In GFS filter parlance:
-    # PRMSL (msl), UGRD (10u), VGRD (10v), TMP (2t), APCP (tp)
-    
-    # TODO: Update these bounding box coordinates once Susovan provides the exact 121x141 grid
     leftlon = 68.0
     rightlon = 103.0
     toplat = 38.0
@@ -38,7 +35,7 @@ def download_latest_gfs(lead_hour: int = 24) -> str:
         'lev_10_m_above_ground': 'on',
         'lev_2_m_above_ground': 'on',
         'lev_mean_sea_level': 'on',
-        'lev_surface': 'on', # for precip
+        'lev_surface': 'on', 
         'var_APCP': 'on',
         'var_PRMSL': 'on',
         'var_TMP': 'on',
@@ -53,13 +50,11 @@ def download_latest_gfs(lead_hour: int = 24) -> str:
     }
 
     try:
+        print(f"Attempting live NOMADS pull: dir={params['dir']}, file={params['file']}")
         response = requests.get(NOMADS_FILTER_URL, params=params, timeout=30)
         response.raise_for_status()
         
-        # In a real pipeline, we'd save this to /model/datasets/ and parse with xarray/cfgrib
         filepath = f"../model/datasets/gfs_{date_str}_{run_hour:02d}_f{lead_hour:03d}.grb2"
-        
-        # Ensure directory exists
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         
         with open(filepath, 'wb') as f:
@@ -68,11 +63,28 @@ def download_latest_gfs(lead_hour: int = 24) -> str:
         status.last_success_time = datetime.datetime.utcnow()
         status.last_status = "success"
         status.error_message = None
+        status.mode = "live"
+        
+        # Cache for demo fallback
+        cache_path = "../model/datasets/gfs_cached_demo.grb2"
+        with open(cache_path, 'wb') as f:
+            f.write(response.content)
+            
         return filepath
 
     except Exception as e:
+        print(f"Live pull failed ({e}). Attempting fallback to cache...")
+        cache_path = "../model/datasets/gfs_cached_demo.grb2"
+        if os.path.exists(cache_path):
+            status.last_success_time = datetime.datetime.utcnow()
+            status.last_status = "success"
+            status.error_message = f"Live failed: {e}. Used cache."
+            status.mode = "cache"
+            return cache_path
+            
         status.last_status = "failed"
         status.error_message = str(e)
+        status.mode = "none"
         raise e
 
 def process_grib_to_schema(filepath: str):
@@ -101,5 +113,6 @@ def get_ingestion_status() -> Dict[str, Any]:
     return {
         "last_status": status.last_status,
         "last_success_time": status.last_success_time.isoformat() if status.last_success_time else None,
-        "error_message": status.error_message
+        "error_message": status.error_message,
+        "mode": status.mode
     }

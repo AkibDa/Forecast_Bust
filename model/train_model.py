@@ -2,32 +2,29 @@ import pandas as pd
 import numpy as np
 import pyarrow.parquet as pq
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss, roc_auc_score
 import pickle
 import os
 
 print("Identifying overlapping dates...")
-era5_meta = pq.ParquetFile('model/datasets/era5_processed.parquet')
-tigge_meta = pq.ParquetFile('model/datasets/tigge_ncep_2023_2024.parquet')
-
-# Read just the valid_time column to find overlap
 era5_dates = pd.read_parquet('model/datasets/era5_processed.parquet', columns=['valid_time'])['valid_time'].unique()
 tigge_dates = pd.read_parquet('model/datasets/tigge_ncep_2023_2024.parquet', columns=['valid_time'])['valid_time'].unique()
 
 common_dates = np.intersect1d(era5_dates, tigge_dates)
+common_dates = np.sort(common_dates)
 print(f"Total overlapping valid_time timestamps: {len(common_dates)}")
 
-# Pick a manageable subset (e.g. 50 dates) to guarantee overlap and fit in memory
-subset_dates = common_dates[:100]
+# Scale up: pick ~300 dates evenly spaced to cover different seasons/months
+if len(common_dates) > 300:
+    indices = np.linspace(0, len(common_dates) - 1, 300, dtype=int)
+    subset_dates = common_dates[indices]
+else:
+    subset_dates = common_dates
 
 print(f"Loading data for {len(subset_dates)} specific valid_time values...")
 era5 = pd.read_parquet('model/datasets/era5_processed.parquet', filters=[('valid_time', 'in', subset_dates)])
 tigge = pd.read_parquet('model/datasets/tigge_ncep_2023_2024.parquet', filters=[('valid_time', 'in', subset_dates)])
-
-print(f"ERA5 subset shape: {era5.shape}")
-print(f"TIGGE subset shape: {tigge.shape}")
 
 # Round lat/lon to avoid floating point precision mismatches during join
 era5['latitude'] = era5['latitude'].round(2)
@@ -43,9 +40,7 @@ merged = pd.merge(
     suffixes=('_fcst', '_obs')
 )
 
-print(f"\nREAL Merged dataset shape: {merged.shape}")
-print("\nSample of matched rows (first 3):")
-print(merged[['valid_time', 'latitude', 'longitude', 'mslp', 'msl', 'temperature_2m', 't2m']].head(3))
+print(f"REAL Merged dataset shape: {merged.shape}")
 
 # Calculate Errors
 error_mappings = {
@@ -60,8 +55,6 @@ print("Computing errors and bust labels...")
 for metric, (t_col, e_col) in error_mappings.items():
     if t_col in merged.columns and e_col in merged.columns:
         merged[f'error_{metric}'] = np.abs(merged[t_col] - merged[e_col])
-    else:
-        print(f"Warning: Columns for {metric} not found. ({t_col}, {e_col})")
 
 thresholds = {
     'error_t2m': 2.0,    # > 2 K error
@@ -74,19 +67,12 @@ for col, thresh in thresholds.items():
     if col in merged.columns:
         merged['is_bust'] = np.where(merged[col] > thresh, 1, merged['is_bust'])
 
-# Ensure some positive and negative classes exist
-if merged['is_bust'].sum() == 0 or merged['is_bust'].sum() == len(merged):
-    print("Warning: Label distribution is severely skewed. Injecting variance for training to succeed.")
-    merged.loc[:len(merged)//2, 'is_bust'] = 1
-    merged.loc[len(merged)//2:, 'is_bust'] = 0
-
 merged['month'] = pd.to_datetime(merged['valid_time']).dt.month
 
-# Feature columns
 feature_cols = ['lead_time_hours', 'latitude', 'longitude', 'month', 'mslp', 'u10_fcst', 'v10_fcst', 'temperature_2m', 'precipitation']
-X = merged[feature_cols].copy()
+X = merged[['valid_time', 'is_bust', 'error_tp', 'error_msl'] + feature_cols].copy()
 
-# Rename features internally so model_interface receives clean dict names (e.g. '10u')
+# Rename features internally
 rename_dict = {
     'mslp': 'msl',
     'u10_fcst': '10u',
@@ -97,12 +83,30 @@ rename_dict = {
 X = X.rename(columns=rename_dict)
 final_feature_cols = ['lead_time_hours', 'latitude', 'longitude', 'month', 'msl', '10u', '10v', '2t', 'tp']
 X = X.fillna(0)
-y = merged['is_bust']
 
-print(f"Bust class ratio: {y.mean():.4f}")
+# --- TIME-BASED SPLIT ---
+print("Performing time-based train/test split...")
+X = X.sort_values('valid_time')
 
-X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.4, random_state=42)
-X_calib, X_test, y_calib, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+n_total = len(X)
+train_idx = int(n_total * 0.7)
+calib_idx = int(n_total * 0.85)
+
+train_data = X.iloc[:train_idx]
+calib_data = X.iloc[train_idx:calib_idx]
+test_data = X.iloc[calib_idx:]
+
+X_train = train_data[final_feature_cols]
+y_train = train_data['is_bust']
+
+X_calib = calib_data[final_feature_cols]
+y_calib = calib_data['is_bust']
+
+X_test = test_data[final_feature_cols]
+y_test = test_data['is_bust']
+
+print(f"Train samples: {len(X_train)}, Calib samples: {len(X_calib)}, Test samples: {len(X_test)}")
+print(f"Test Set Bust Ratio: {y_test.mean():.4f}")
 
 print("Training XGBoost...")
 xgb_model = xgb.XGBClassifier(
@@ -123,12 +127,27 @@ y_pred_prob = calibrated_model.predict_proba(X_test)[:, 1]
 brier = brier_score_loss(y_test, y_pred_prob)
 auc = roc_auc_score(y_test, y_pred_prob)
 
-print(f"\nModel Performance on REAL Test Set:")
+print(f"\nModel Performance on TIME-BASED Test Set:")
 print(f"Brier Score: {brier:.4f}")
 print(f"ROC AUC: {auc:.4f}")
 
-# Save Model
 os.makedirs('model/weights', exist_ok=True)
 with open('model/weights/calibrated_xgb.pkl', 'wb') as f:
     pickle.dump(calibrated_model, f)
 print("Model saved to model/weights/calibrated_xgb.pkl")
+
+# --- BACKTEST EXTREME EVENTS ---
+print("\n--- Backtesting Extreme Events in Test Set ---")
+test_data['predicted_bust_prob'] = y_pred_prob
+test_data['confidence_score'] = 1.0 - y_pred_prob
+
+# Find the top 3 extreme precipitation busts in the test set
+extreme_precip_cases = test_data[test_data['is_bust'] == 1].sort_values('error_tp', ascending=False).head(3)
+
+print("Top 3 Heavy Rainfall/Extreme Error Cases Discovered in Data:")
+for idx, row in extreme_precip_cases.iterrows():
+    date_str = str(row['valid_time']).split(' ')[0]
+    print(f"\nEvent Date: {date_str}, Location: ({row['latitude']:.2f}, {row['longitude']:.2f})")
+    print(f"Observed error in precipitation (tp): {row['error_tp']:.2f} mm")
+    print(f"Predicted Bust Probability: {row['predicted_bust_prob']:.4f}")
+    print(f"Confidence Score: {row['confidence_score']:.4f}")
