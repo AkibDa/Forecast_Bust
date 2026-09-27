@@ -1,11 +1,19 @@
 import { useState, useEffect } from 'react'
 import axios from 'axios'
-import { MapContainer, TileLayer, CircleMarker, Popup, useMap } from 'react-leaflet'
+import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
 import './App.css'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 const DEFAULT_DATE = "2026-09-26" // Using the date from API contract
+
+// Utility to generate a gradient color based on confidence score (0 to 1)
+// Red (0) -> Yellow (0.5) -> Green (1)
+const getColor = (value) => {
+  // Hue ranges from 0 (red) to 120 (green)
+  const hue = value * 120;
+  return `hsl(${hue}, 80%, 50%)`;
+}
 
 function App() {
   const [leadDay, setLeadDay] = useState(1)
@@ -56,19 +64,12 @@ function App() {
     fetchDetails()
   }, [selectedGrid, leadDay])
 
-  // Get color based on confidence (0 to 1) -> green for high, red for low
-  const getColor = (confidence) => {
-    if (confidence > 0.8) return 'green';
-    if (confidence > 0.5) return 'orange';
-    return 'red';
-  }
-
   return (
     <div className="dashboard">
       <header className="header">
         <h1>Forecast Bust Detection</h1>
         <div className="slider-container">
-          <label>Lead Day: {leadDay}</label>
+          <span className="slider-label">LEAD DAY</span>
           <input 
             type="range" 
             min="1" 
@@ -76,36 +77,40 @@ function App() {
             value={leadDay} 
             onChange={(e) => setLeadDay(parseInt(e.target.value))}
           />
+          <span className="slider-value">{leadDay}</span>
         </div>
       </header>
 
       <div className="main-content">
         <div className="map-panel">
-          <MapContainer center={[22.5, 88.25]} zoom={7} scrollWheelZoom={true} className="map">
+          <MapContainer center={[23.0, 85.5]} zoom={5} scrollWheelZoom={true} className="map">
             <TileLayer
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             />
             {mapData?.features?.map((feature, idx) => {
               const { grid_id, confidence_score } = feature.properties
               const [lng, lat] = feature.geometry.coordinates
+              const color = getColor(confidence_score)
+              
               return (
                 <CircleMarker 
                   key={idx}
                   center={[lat, lng]} 
-                  radius={8}
+                  radius={7}
                   pathOptions={{ 
-                    color: getColor(confidence_score), 
-                    fillColor: getColor(confidence_score), 
-                    fillOpacity: 0.6 
+                    color: color, 
+                    fillColor: color, 
+                    fillOpacity: 0.8,
+                    weight: 1
                   }}
                   eventHandlers={{
                     click: () => setSelectedGrid(grid_id)
                   }}
                 >
                   <Popup>
-                    Grid: {grid_id} <br/>
-                    Confidence: {confidence_score}
+                    <strong>Grid:</strong> {grid_id} <br/>
+                    <strong>Confidence:</strong> {(confidence_score * 100).toFixed(1)}%
                   </Popup>
                 </CircleMarker>
               )
@@ -119,38 +124,49 @@ function App() {
             
             {timeseriesData ? (
               <div className="card">
-                <h3>Trend (Days 1-10)</h3>
-                <ul>
+                <h3>Confidence Trend</h3>
+                <div className="trend-list">
                   {timeseriesData.lead_times.map(lt => (
-                    <li key={lt.lead_day}>
-                      Day {lt.lead_day}: {lt.confidence_score}
-                    </li>
+                    <div key={lt.lead_day} className="trend-item">
+                      <span className="trend-day">Day {lt.lead_day}</span>
+                      <span className="trend-score" style={{ color: getColor(lt.confidence_score) }}>
+                        {(lt.confidence_score * 100).toFixed(0)}%
+                      </span>
+                    </div>
                   ))}
-                </ul>
+                </div>
               </div>
-            ) : <p>Loading timeseries...</p>}
+            ) : <p className="loading">Loading timeseries...</p>}
 
             {explanationData ? (
               <div className="card">
                 <h3>Explanation (Day {leadDay})</h3>
+                
                 <h4>Top Drivers</h4>
-                <ul>
+                <div className="driver-list">
                   {explanationData.top_drivers.map((drv, i) => (
-                    <li key={i}>{drv.feature}: {drv.contribution} ({drv.direction})</li>
+                    <div key={i} className={`driver-item ${drv.direction}`}>
+                      <span className="driver-feat">{drv.feature}</span>
+                      <span className="driver-val">{drv.contribution > 0 ? '+' : ''}{drv.contribution.toFixed(2)}</span>
+                    </div>
                   ))}
-                </ul>
-                <h4>Analogs</h4>
-                <ul>
+                </div>
+
+                <h4>Historical Analogs</h4>
+                <div className="analog-list">
                   {explanationData.analogs.map((ana, i) => (
-                    <li key={i}>
-                      {ana.event_name} ({ana.case_date})<br/>
-                      <small>Similarity: {ana.similarity_score}</small><br/>
-                      <small>{ana.historical_error_summary}</small>
-                    </li>
+                    <div key={i} className="analog-item">
+                      <div className="analog-header">
+                        <span className="analog-name">{ana.event_name}</span>
+                        <span className="analog-date">{ana.case_date}</span>
+                      </div>
+                      <div className="analog-score">Similarity: {(ana.similarity_score * 100).toFixed(1)}%</div>
+                      <div className="analog-desc">{ana.historical_error_summary}</div>
+                    </div>
                   ))}
-                </ul>
+                </div>
               </div>
-            ) : <p>Loading explanation...</p>}
+            ) : <p className="loading">Loading explanation...</p>}
           </div>
         )}
       </div>

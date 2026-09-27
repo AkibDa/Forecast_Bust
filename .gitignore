@@ -1,0 +1,9 @@
+.venv/
+__pycache__
+.env
+node_modules/
+backend/app/__pycache__/*.pyc
+backend/app/__pycache__/confidence.cpython-313.pyc
+backend/app/__pycache__/explanation.cpython-313.pyc
+backend/app/__pycache__/health.cpython-313.pyc
+backend/app/__pycache__/model_interface.cpython-313.pyc
