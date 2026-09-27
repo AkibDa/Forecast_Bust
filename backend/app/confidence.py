@@ -48,9 +48,10 @@ def get_confidence_map(forecast_date: str, lead_day: int) -> Dict[str, Any]:
     features_list = []
     
     # 121x141 grid simulation
-    # Using a subset or downsampled version to keep response times low for the MVP demo
-    lats = np.linspace(8.0, 38.0, 30) # downsampled from 121 for performance
-    lons = np.linspace(68.0, 103.0, 35) # downsampled from 141 for performance
+    # Use a step of 1.0 to downsample while strictly staying on the 0.25 grid.
+    # This ensures exact matches against the parquet datasets without triggering the mock fallback.
+    lats = np.arange(8.0, 38.1, 1.0) # 31 points
+    lons = np.arange(68.0, 103.1, 1.0) # 36 points
     
     for lat in lats:
         for lon in lons:

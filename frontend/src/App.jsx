@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import axios from 'axios'
-import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet'
+import { MapContainer, TileLayer, GeoJSON } from 'react-leaflet'
+import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import './App.css'
 
@@ -88,33 +89,28 @@ function App() {
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             />
-            {mapData?.features?.map((feature, idx) => {
-              const { grid_id, confidence_score } = feature.properties
-              const [lng, lat] = feature.geometry.coordinates
-              const color = getColor(confidence_score)
-              
-              return (
-                <CircleMarker 
-                  key={idx}
-                  center={[lat, lng]} 
-                  radius={7}
-                  pathOptions={{ 
-                    color: color, 
-                    fillColor: color, 
+            {mapData && (
+              <GeoJSON 
+                key={JSON.stringify(mapData.features[0]?.properties?.grid_id) + leadDay} // force re-render on data change
+                data={mapData}
+                pointToLayer={(feature, latlng) => {
+                  const { confidence_score } = feature.properties;
+                  const color = getColor(confidence_score);
+                  return L.circleMarker(latlng, {
+                    radius: 7,
+                    color: color,
+                    fillColor: color,
                     fillOpacity: 0.8,
                     weight: 1
-                  }}
-                  eventHandlers={{
-                    click: () => setSelectedGrid(grid_id)
-                  }}
-                >
-                  <Popup>
-                    <strong>Grid:</strong> {grid_id} <br/>
-                    <strong>Confidence:</strong> {(confidence_score * 100).toFixed(1)}%
-                  </Popup>
-                </CircleMarker>
-              )
-            })}
+                  });
+                }}
+                onEachFeature={(feature, layer) => {
+                  const { grid_id, confidence_score } = feature.properties;
+                  layer.on('click', () => setSelectedGrid(grid_id));
+                  layer.bindPopup(`<strong>Grid:</strong> ${grid_id} <br/><strong>Confidence:</strong> ${(confidence_score * 100).toFixed(1)}%`);
+                }}
+              />
+            )}
           </MapContainer>
         </div>
 
