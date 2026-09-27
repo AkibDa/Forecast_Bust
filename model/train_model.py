@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import pyarrow.parquet as pq
 import xgboost as xgb
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss, roc_auc_score
@@ -122,14 +121,23 @@ print("Calibrating model...")
 calibrated_model = CalibratedClassifierCV(estimator=xgb_model, method='isotonic', cv=3)
 calibrated_model.fit(X_train, y_train)
 
-# Evaluation
+from sklearn.metrics import brier_score_loss, roc_auc_score, confusion_matrix, precision_score, recall_score
+# ...
 y_pred_prob = calibrated_model.predict_proba(X_test)[:, 1]
+y_pred = (y_pred_prob > 0.5).astype(int)
+
 brier = brier_score_loss(y_test, y_pred_prob)
 auc = roc_auc_score(y_test, y_pred_prob)
+precision = precision_score(y_test, y_pred)
+recall = recall_score(y_test, y_pred)
+cm = confusion_matrix(y_test, y_pred)
 
 print(f"\nModel Performance on TIME-BASED Test Set:")
 print(f"Brier Score: {brier:.4f}")
 print(f"ROC AUC: {auc:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"Confusion Matrix:\n{cm}")
 
 os.makedirs('model/weights', exist_ok=True)
 with open('model/weights/calibrated_xgb.pkl', 'wb') as f:
@@ -138,16 +146,43 @@ print("Model saved to model/weights/calibrated_xgb.pkl")
 
 # --- BACKTEST EXTREME EVENTS ---
 print("\n--- Backtesting Extreme Events in Test Set ---")
+test_data = test_data.copy()
 test_data['predicted_bust_prob'] = y_pred_prob
 test_data['confidence_score'] = 1.0 - y_pred_prob
 
-# Find the top 3 extreme precipitation busts in the test set
-extreme_precip_cases = test_data[test_data['is_bust'] == 1].sort_values('error_tp', ascending=False).head(3)
+# Find the extreme precipitation busts in the test set
+extreme_candidates = test_data[test_data['is_bust'] == 1].sort_values('error_tp', ascending=False)
 
-print("Top 3 Heavy Rainfall/Extreme Error Cases Discovered in Data:")
-for idx, row in extreme_precip_cases.iterrows():
+selected_events = []
+for idx, row in extreme_candidates.iterrows():
+    if len(selected_events) >= 3:
+        break
+        
     date_str = str(row['valid_time']).split(' ')[0]
-    print(f"\nEvent Date: {date_str}, Location: ({row['latitude']:.2f}, {row['longitude']:.2f})")
-    print(f"Observed error in precipitation (tp): {row['error_tp']:.2f} mm")
-    print(f"Predicted Bust Probability: {row['predicted_bust_prob']:.4f}")
-    print(f"Confidence Score: {row['confidence_score']:.4f}")
+    lat = row['latitude']
+    lon = row['longitude']
+    
+    # Check if this candidate is sufficiently independent from already selected events
+    is_independent = True
+    for ev in selected_events:
+        dist = np.sqrt((ev['lat'] - lat)**2 + (ev['lon'] - lon)**2)
+        if ev['date'] == date_str or dist < 2.0:
+            is_independent = False
+            break
+            
+    if is_independent:
+        selected_events.append({
+            'date': date_str,
+            'lat': lat,
+            'lon': lon,
+            'error': row['error_tp'],
+            'prob': row['predicted_bust_prob'],
+            'conf': row['confidence_score']
+        })
+
+print("Top 3 INDEPENDENT Heavy Rainfall/Extreme Error Cases:")
+for ev in selected_events:
+    print(f"\nEvent Date: {ev['date']}, Location: ({ev['lat']:.2f}, {ev['lon']:.2f})")
+    print(f"Observed error in precipitation (tp): {ev['error']:.2f} mm")
+    print(f"Predicted Bust Probability: {ev['prob']:.4f}")
+    print(f"Confidence Score: {ev['conf']:.4f}")
