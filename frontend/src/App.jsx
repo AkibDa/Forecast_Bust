@@ -83,9 +83,7 @@ function App() {
 
       <div className="main-content">
         <div className="map-panel">
-          {/* TODO: Update map center/bounds and zoom level once Susovan shares exact lat/lon bounding box */}
-          {/* Currently defaults to India center */}
-          <MapContainer center={[22.5, 88.25]} zoom={5} scrollWheelZoom={true} className="map">
+          <MapContainer center={[23.0, 85.5]} zoom={5} scrollWheelZoom={true} className="map">
             <TileLayer
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"

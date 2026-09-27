@@ -29,7 +29,7 @@ def download_latest_gfs(lead_hour: int = 24) -> str:
     
     # TODO: Update these bounding box coordinates once Susovan provides the exact 121x141 grid
     leftlon = 68.0
-    rightlon = 98.0
+    rightlon = 103.0
     toplat = 38.0
     bottomlat = 8.0
 
