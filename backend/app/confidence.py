@@ -1,5 +1,6 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from pydantic import BaseModel
+import numpy as np
 from .model_interface import predict
 
 class TimeseriesData(BaseModel):
@@ -23,7 +24,7 @@ def get_timeseries(grid_id: str, forecast_date: str) -> TimeseriesResponse:
         lat, lon = 22.5, 88.25
 
     lead_times = []
-    # Mock data for Day 1 to 10 using Susovan's interface
+    # Call predict() for Day 1 to 10
     for day in range(1, 11):
         prediction = predict(lat, lon, forecast_date, day)
         lead_times.append(
@@ -33,12 +34,6 @@ def get_timeseries(grid_id: str, forecast_date: str) -> TimeseriesResponse:
                 bust_probability=prediction["bust_probability"]
             )
         )
-    
-    # Example exact match for grid 22.5_88.25 Day 1-3 if date matches
-    if grid_id == "22.5_88.25" and forecast_date == "2026-09-26":
-        lead_times[0] = TimeseriesData(lead_day=1, confidence_score=0.91, bust_probability=0.09)
-        lead_times[1] = TimeseriesData(lead_day=2, confidence_score=0.85, bust_probability=0.15)
-        lead_times[2] = TimeseriesData(lead_day=3, confidence_score=0.58, bust_probability=0.42)
 
     return TimeseriesResponse(
         grid_id=grid_id,
@@ -49,33 +44,30 @@ def get_timeseries(grid_id: str, forecast_date: str) -> TimeseriesResponse:
     )
 
 def get_confidence_map(forecast_date: str, lead_day: int) -> Dict[str, Any]:
-    # GeoJSON FeatureCollection
-    # Creating a sample grid around 22.5, 88.25
     features = []
-    for lat_offset in [-0.5, 0.0, 0.5]:
-        for lon_offset in [-0.5, 0.0, 0.5]:
-            lat = round(22.5 + lat_offset, 2)
-            lon = round(88.25 + lon_offset, 2)
-            grid_id = f"{lat}_{lon}"
-            prediction = predict(lat, lon, forecast_date, lead_day)
+    
+    # 121x141 grid simulation
+    # Using a subset or downsampled version to keep response times low for the MVP demo
+    # We'll step by a larger amount but keep the logic consistent.
+    lats = np.linspace(8.0, 38.0, 30) # downsampled from 121 for performance
+    lons = np.linspace(68.0, 103.0, 35) # downsampled from 141 for performance
+    
+    for lat in lats:
+        for lon in lons:
+            lat_r = round(lat, 2)
+            lon_r = round(lon, 2)
+            grid_id = f"{lat_r}_{lon_r}"
+            prediction = predict(lat_r, lon_r, forecast_date, lead_day)
             
-            # Exact match for contract example
-            if grid_id == "22.5_88.25":
-                cs = 0.42
-                bp = 0.58
-            else:
-                cs = prediction["confidence_score"]
-                bp = prediction["bust_probability"]
-
             features.append({
                 "type": "Feature",
-                "geometry": { "type": "Point", "coordinates": [lon, lat] },
+                "geometry": { "type": "Point", "coordinates": [lon_r, lat_r] },
                 "properties": {
                     "grid_id": grid_id,
-                    "latitude": lat,
-                    "longitude": lon,
-                    "confidence_score": cs,
-                    "bust_probability": bp,
+                    "latitude": lat_r,
+                    "longitude": lon_r,
+                    "confidence_score": prediction["confidence_score"],
+                    "bust_probability": prediction["bust_probability"],
                     "regime_tag": None
                 }
             })
