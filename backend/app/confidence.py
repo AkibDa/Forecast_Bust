@@ -1,8 +1,10 @@
+import pandas as pd
 from typing import List, Dict, Any
 from pydantic import BaseModel
-import numpy as np
-from .model_interface import predict
-from .feature_provider import get_forecast_features
+# pyrefly: ignore [missing-import]
+from .model_interface import predict, predict_batch
+# pyrefly: ignore [missing-import]
+from .feature_provider import get_forecast_features, get_forecast_features_batch
 
 class TimeseriesData(BaseModel):
     lead_day: int
@@ -14,6 +16,7 @@ class TimeseriesResponse(BaseModel):
     latitude: float
     longitude: float
     forecast_date: str
+    data_source: str
     lead_times: List[TimeseriesData]
 
 def get_timeseries(grid_id: str, forecast_date: str) -> TimeseriesResponse:
@@ -22,60 +25,67 @@ def get_timeseries(grid_id: str, forecast_date: str) -> TimeseriesResponse:
         lat = float(lat_str)
         lon = float(lon_str)
     except ValueError:
-        lat, lon = 23.0, 85.5
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="Invalid grid_id format. Must be 'lat_lon'")
 
     lead_times = []
+    mode_used = "unknown"
     for day in range(1, 11):
-        features = get_forecast_features(lat, lon, forecast_date, day)
-        prediction = predict(features)
-        lead_times.append(
-            TimeseriesData(
-                lead_day=day,
-                confidence_score=prediction["confidence_score"],
-                bust_probability=prediction["bust_probability"]
+        try:
+            features, mode = get_forecast_features(lat, lon, forecast_date, day)
+            prediction = predict(features)
+            mode_used = mode
+            lead_times.append(
+                TimeseriesData(
+                    lead_day=day,
+                    confidence_score=prediction["confidence_score"],
+                    bust_probability=prediction["bust_probability"]
+                )
             )
-        )
+        except Exception:
+            pass # skip unavailable lead days for timeseries
 
     return TimeseriesResponse(
         grid_id=grid_id,
         latitude=lat,
         longitude=lon,
         forecast_date=forecast_date,
+        data_source=mode_used,
         lead_times=lead_times
     )
 
 def get_confidence_map(forecast_date: str, lead_day: int) -> Dict[str, Any]:
+    # Extract features for entire grid in one shot
+    features_df, mode = get_forecast_features_batch(forecast_date, lead_day)
+    
+    # Predict in one shot
+    results_df = predict_batch(features_df)
+    
     features_list = []
-    
-    # 121x141 grid simulation
-    # Use a step of 1.0 to downsample while strictly staying on the 0.25 grid.
-    # This ensures exact matches against the parquet datasets without triggering the mock fallback.
-    lats = np.arange(8.0, 38.1, 1.0) # 31 points
-    lons = np.arange(68.0, 103.1, 1.0) # 36 points
-    
-    for lat in lats:
-        for lon in lons:
-            lat_r = round(lat, 2)
-            lon_r = round(lon, 2)
-            grid_id = f"{lat_r}_{lon_r}"
-            
-            features = get_forecast_features(lat_r, lon_r, forecast_date, lead_day)
-            prediction = predict(features)
-            
-            features_list.append({
-                "type": "Feature",
-                "geometry": { "type": "Point", "coordinates": [lon_r, lat_r] },
-                "properties": {
-                    "grid_id": grid_id,
-                    "latitude": lat_r,
-                    "longitude": lon_r,
-                    "confidence_score": prediction["confidence_score"],
-                    "bust_probability": prediction["bust_probability"],
-                    "regime_tag": None
-                }
-            })
+    for _, row in results_df.iterrows():
+        lat_r = row['latitude']
+        lon_r = row['longitude']
+        grid_id = f"{lat_r:.2f}_{lon_r:.2f}"
+        
+        features_list.append({
+            "type": "Feature",
+            "geometry": { "type": "Point", "coordinates": [lon_r, lat_r] },
+            "properties": {
+                "grid_id": grid_id,
+                "latitude": lat_r,
+                "longitude": lon_r,
+                "confidence_score": row["confidence_score"],
+                "bust_probability": row["bust_probability"],
+                "regime_tag": None
+            }
+        })
             
     return {
         "type": "FeatureCollection",
+        "metadata": {
+            "data_source": mode,
+            "forecast_date": forecast_date,
+            "lead_day": lead_day
+        },
         "features": features_list
     }

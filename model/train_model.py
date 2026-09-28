@@ -7,14 +7,27 @@ import pickle
 import os
 
 print("Identifying overlapping dates...")
-era5_dates = pd.read_parquet('model/datasets/era5_processed.parquet', columns=['valid_time'])['valid_time'].unique()
-tigge_dates = pd.read_parquet('model/datasets/tigge_ncep_2023_2024.parquet', columns=['valid_time'])['valid_time'].unique()
+era5 = pd.read_parquet('model/datasets/era5_processed.parquet')
+tigge = pd.read_parquet('model/datasets/tigge_ncep_2023_2024.parquet')
 
-common_dates = np.intersect1d(era5_dates, tigge_dates)
+# Convert ERA5 tp from meters to mm
+if 'tp' in era5.columns:
+    era5['tp'] = era5['tp'] * 1000.0
+
+# Convert TIGGE tp from accumulated to 24h differenced
+if 'init_time' not in tigge.columns:
+    tigge['init_time'] = pd.to_datetime(tigge['valid_time']) - pd.to_timedelta(tigge['lead_time_hours'], unit='h')
+
+tigge = tigge.sort_values(['latitude', 'longitude', 'init_time', 'lead_time_hours'])
+tigge['precip_24h'] = tigge.groupby(['latitude', 'longitude', 'init_time'])['precipitation'].diff().fillna(tigge['precipitation'])
+# Ensure no negative precip from bad differencing
+tigge['precip_24h'] = tigge['precip_24h'].clip(lower=0)
+tigge['precipitation'] = tigge['precip_24h']
+
+common_dates = np.intersect1d(era5['valid_time'].unique(), tigge['valid_time'].unique())
 common_dates = np.sort(common_dates)
 print(f"Total overlapping valid_time timestamps: {len(common_dates)}")
 
-# Scale up: pick ~300 dates evenly spaced to cover different seasons/months
 if len(common_dates) > 300:
     indices = np.linspace(0, len(common_dates) - 1, 300, dtype=int)
     subset_dates = common_dates[indices]
@@ -22,18 +35,17 @@ else:
     subset_dates = common_dates
 
 print(f"Loading data for {len(subset_dates)} specific valid_time values...")
-era5 = pd.read_parquet('model/datasets/era5_processed.parquet', filters=[('valid_time', 'in', subset_dates)])
-tigge = pd.read_parquet('model/datasets/tigge_ncep_2023_2024.parquet', filters=[('valid_time', 'in', subset_dates)])
+era5_sub = era5[era5['valid_time'].isin(subset_dates)].copy()
+tigge_sub = tigge[tigge['valid_time'].isin(subset_dates)].copy()
 
-# Round lat/lon to avoid floating point precision mismatches during join
-era5['latitude'] = era5['latitude'].round(2)
-era5['longitude'] = era5['longitude'].round(2)
-tigge['latitude'] = tigge['latitude'].round(2)
-tigge['longitude'] = tigge['longitude'].round(2)
+era5_sub['latitude'] = era5_sub['latitude'].round(2)
+era5_sub['longitude'] = era5_sub['longitude'].round(2)
+tigge_sub['latitude'] = tigge_sub['latitude'].round(2)
+tigge_sub['longitude'] = tigge_sub['longitude'].round(2)
 
 print("Merging datasets...")
 merged = pd.merge(
-    tigge, era5,
+    tigge_sub, era5_sub,
     on=['valid_time', 'latitude', 'longitude'],
     how='inner',
     suffixes=('_fcst', '_obs')
@@ -41,30 +53,39 @@ merged = pd.merge(
 
 print(f"REAL Merged dataset shape: {merged.shape}")
 
-# Calculate Errors
-error_mappings = {
-    'msl': ('mslp', 'msl'),
-    'u10': ('u10_fcst', 'u10_obs'),
-    'v10': ('v10_fcst', 'v10_obs'),
-    't2m': ('temperature_2m', 't2m'),
-    'tp': ('precipitation', 'tp')
-}
+print("Computing bias-corrected errors and bust labels...")
+merged['raw_err_t2m'] = merged['temperature_2m'] - merged['t2m']
+merged['raw_err_msl'] = merged['mslp'] - merged['msl']
+merged['raw_err_tp'] = merged['precipitation'] - merged['tp']
 
-print("Computing errors and bust labels...")
-for metric, (t_col, e_col) in error_mappings.items():
-    if t_col in merged.columns and e_col in merged.columns:
-        merged[f'error_{metric}'] = np.abs(merged[t_col] - merged[e_col])
+group_cols = ['latitude', 'longitude', 'lead_time_hours']
+stats = merged.groupby(group_cols)[['raw_err_t2m', 'raw_err_msl', 'raw_err_tp']].agg(['mean', 'std']).reset_index()
+stats.columns = group_cols + [
+    'mean_err_t2m', 'std_err_t2m',
+    'mean_err_msl', 'std_err_msl',
+    'mean_err_tp',  'std_err_tp'
+]
 
-thresholds = {
-    'error_t2m': 2.0,    # > 2 K error
-    'error_msl': 500.0,  # > 500 Pa (5 hPa) error
-    'error_tp': 10.0     # > 10 mm error
-}
+merged = pd.merge(merged, stats, on=group_cols, how='left')
 
-merged['is_bust'] = 0
-for col, thresh in thresholds.items():
-    if col in merged.columns:
-        merged['is_bust'] = np.where(merged[col] > thresh, 1, merged['is_bust'])
+# Normalized absolute errors (z-scores)
+merged['z_t2m'] = np.abs(merged['raw_err_t2m'] - merged['mean_err_t2m']) / (merged['std_err_t2m'] + 1e-6)
+merged['z_msl'] = np.abs(merged['raw_err_msl'] - merged['mean_err_msl']) / (merged['std_err_msl'] + 1e-6)
+merged['z_tp']  = np.abs(merged['raw_err_tp'] - merged['mean_err_tp']) / (merged['std_err_tp'] + 1e-6)
+
+# Top 10% bust definition across any variable
+merged['max_z'] = merged[['z_t2m', 'z_msl', 'z_tp']].max(axis=1)
+q90 = merged.groupby('lead_time_hours')['max_z'].quantile(0.90).reset_index(name='q90_z')
+merged = pd.merge(merged, q90, on='lead_time_hours', how='left')
+
+merged['is_bust'] = (merged['max_z'] > merged['q90_z']).astype(int)
+# Store absolute tp error for the backtest display
+merged['error_tp'] = np.abs(merged['raw_err_tp'])
+merged['error_msl'] = np.abs(merged['raw_err_msl'])
+
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '../backend'))
+from app.shared_utils import get_month_from_dates
 
 merged['month'] = pd.to_datetime(merged['valid_time']).dt.month
 
@@ -107,6 +128,18 @@ y_test = test_data['is_bust']
 print(f"Train samples: {len(X_train)}, Calib samples: {len(X_calib)}, Test samples: {len(X_test)}")
 print(f"Test Set Bust Ratio: {y_test.mean():.4f}")
 
+# BASELINE EVALUATIONS
+print("\n--- BASELINES ---")
+X_train_a = X_train[['lead_time_hours']]
+X_test_a = X_test[['lead_time_hours']]
+model_a = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42, n_jobs=-1)
+model_a.fit(X_train_a, y_train)
+pred_a = model_a.predict_proba(X_test_a)[:, 1]
+brier_a = brier_score_loss(y_test, pred_a)
+auc_a = roc_auc_score(y_test, pred_a)
+print(f"Baseline A (lead_time only) - AUC: {auc_a:.4f}, Brier: {brier_a:.4f}")
+
+print("\n--- FULL MODEL ---")
 print("Training XGBoost...")
 xgb_model = xgb.XGBClassifier(
     n_estimators=100,
@@ -122,7 +155,6 @@ calibrated_model = CalibratedClassifierCV(estimator=xgb_model, method='isotonic'
 calibrated_model.fit(X_train, y_train)
 
 from sklearn.metrics import brier_score_loss, roc_auc_score, confusion_matrix, precision_score, recall_score
-# ...
 y_pred_prob = calibrated_model.predict_proba(X_test)[:, 1]
 y_pred = (y_pred_prob > 0.5).astype(int)
 
@@ -138,6 +170,9 @@ print(f"ROC AUC: {auc:.4f}")
 print(f"Precision: {precision:.4f}")
 print(f"Recall: {recall:.4f}")
 print(f"Confusion Matrix:\n{cm}")
+
+gain_auc = auc - auc_a
+print(f"\nGain over Baseline A (AUC): +{gain_auc:.4f}")
 
 os.makedirs('model/weights', exist_ok=True)
 with open('model/weights/calibrated_xgb.pkl', 'wb') as f:
