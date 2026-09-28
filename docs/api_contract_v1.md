@@ -192,3 +192,6 @@ Basic liveness check for the demo/integration testing.
 - Regime classification / clustering — requires unsupervised clustering step on synoptic fields, not yet built
 
 This version is locked for Day 2 start.
+
+
+<!-- Updated Domain to 5-35N, 65-100E -->

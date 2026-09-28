@@ -1,173 +1,270 @@
-import { useState, useEffect } from 'react'
-import axios from 'axios'
-import { MapContainer, TileLayer, GeoJSON } from 'react-leaflet'
-import L from 'leaflet'
-import 'leaflet/dist/leaflet.css'
-import './App.css'
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import useSystemHealth from './hooks/useSystemHealth';
+import useConfidenceMap from './hooks/useConfidenceMap';
+import useGridDetails from './hooks/useGridDetails';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
-const DEFAULT_DATE = "2026-09-26" // Using the date from API contract
+import OperationalHeader from './components/Header/OperationalHeader';
+import DashboardControls from './components/Controls/DashboardControls';
+import LeafletConfidenceMap from './components/Map/LeafletConfidenceMap';
+import IntelligencePanel from './components/IntelligencePanel/IntelligencePanel';
+import ConfidenceTrajectoryBar from './components/Trajectory/ConfidenceTrajectoryBar';
+import { X } from 'lucide-react';
+import './App.css';
 
-// Utility to generate a gradient color based on confidence score (0 to 1)
-// Red (0) -> Yellow (0.5) -> Green (1)
-const getColor = (value) => {
-  // Hue ranges from 0 (red) to 120 (green)
-  const hue = value * 120;
-  return `hsl(${hue}, 80%, 50%)`;
-}
-
-function App() {
-  const [leadDay, setLeadDay] = useState(1)
-  const [mapData, setMapData] = useState(null)
-  const [selectedGrid, setSelectedGrid] = useState(null)
-  const [timeseriesData, setTimeseriesData] = useState(null)
-  const [explanationData, setExplanationData] = useState(null)
-
-  // Fetch Confidence Map
+export function App() {
   useEffect(() => {
-    const fetchMap = async () => {
-      try {
-        const response = await axios.get(`${API_BASE_URL}/api/v1/confidence-map`, {
-          params: { forecast_date: DEFAULT_DATE, lead_day: leadDay }
-        })
-        setMapData(response.data)
-      } catch (error) {
-        console.error("Failed to fetch map data", error)
+    console.log('[APP] mounted');
+  }, []);
+
+  // 1. Backend Health & Coverage State
+  const {
+    health,
+    coverage,
+    loading: healthLoading,
+    ingesting,
+    error: healthError,
+    refreshHealth,
+    triggerManualIngest,
+  } = useSystemHealth();
+
+  // 2. Active Query State
+  const [forecastDate, setForecastDate] = useState('');
+  const [currentLeadDay, setCurrentLeadDay] = useState(1);
+  const [selectedGrid, setSelectedGrid] = useState(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [dismissedAlert, setDismissedAlert] = useState(false);
+
+  // 3. Dynamic Date Initialization (from backend coverage)
+  useEffect(() => {
+    if (!forecastDate && coverage) {
+      if (coverage.live && coverage.live.length > 0) {
+        setForecastDate(coverage.live[0]);
+      } else if (coverage.historical && coverage.historical.length > 0) {
+        const latestHist = coverage.historical[coverage.historical.length - 1];
+        setForecastDate(latestHist);
+      } else if (Array.isArray(coverage) && coverage.length > 0) {
+        setForecastDate(coverage[coverage.length - 1]);
       }
     }
-    fetchMap()
-  }, [leadDay])
+  }, [coverage, forecastDate]);
 
-  // Fetch Grid Details
+  // 4. Mode Determination (Live GFS vs TIGGE Archive)
+  const isLiveMode = useMemo(() => {
+    if (!forecastDate) return true;
+    if (coverage?.live && coverage.live.includes(forecastDate)) {
+      return true;
+    }
+    try {
+      const dt = new Date(forecastDate);
+      const now = new Date();
+      const diffDays = (now - dt) / (1000 * 60 * 60 * 24);
+      return diffDays <= 5 && dt.getFullYear() >= 2026;
+    } catch {
+      return false;
+    }
+  }, [forecastDate, coverage]);
+
+  // 5. Supported Lead Days Enforcing (Live mode supports D1 only; Archive supports D1-D10)
+  const supportedLeadDays = useMemo(() => {
+    if (isLiveMode) {
+      return [1];
+    }
+    return [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+  }, [isLiveMode]);
+
+  // Automatically reset to Day 1 if switching to live mode while on Day > 1
   useEffect(() => {
-    if (!selectedGrid) {
-      setTimeseriesData(null)
-      setExplanationData(null)
-      return
+    if (isLiveMode && currentLeadDay > 1) {
+      setCurrentLeadDay(1);
     }
+  }, [isLiveMode, currentLeadDay]);
 
-    const fetchDetails = async () => {
-      try {
-        const [tsResponse, expResponse] = await Promise.all([
-          axios.get(`${API_BASE_URL}/api/v1/grid/${selectedGrid}/timeseries`, {
-            params: { forecast_date: DEFAULT_DATE }
-          }),
-          axios.get(`${API_BASE_URL}/api/v1/grid/${selectedGrid}/explanation`, {
-            params: { forecast_date: DEFAULT_DATE, lead_day: leadDay }
-          })
-        ])
-        setTimeseriesData(tsResponse.data)
-        setExplanationData(expResponse.data)
-      } catch (error) {
-        console.error("Failed to fetch grid details", error)
-      }
+  // 6. Confidence Map Query Hook (Do not request map too early before health & coverage are ready)
+  const isReady = Boolean(health && coverage && forecastDate);
+
+  const {
+    mapData,
+    loading: mapLoading,
+    error: mapError,
+    stats,
+    getBustColor,
+    refetchMap,
+  } = useConfidenceMap(forecastDate, currentLeadDay, isReady);
+
+  // 7. Grid Details Query Hook
+  const {
+    timeseriesData,
+    explanationData,
+    timeseriesLoading,
+    explanationLoading,
+    timeseriesError,
+    explanationError,
+    clearSelection,
+    refetchTimeseries,
+    refetchExplanation,
+  } = useGridDetails(selectedGrid, forecastDate, currentLeadDay);
+
+  // 8. Find feature properties for currently selected grid
+  const selectedFeatureProps = useMemo(() => {
+    if (!selectedGrid || !mapData?.features) return null;
+    const match = mapData.features.find(
+      (f) => f.properties?.grid_id === selectedGrid
+    );
+    return match ? match.properties : null;
+  }, [selectedGrid, mapData]);
+
+  // 9. Manual Ingestion Handler
+  const handleIngest = async () => {
+    try {
+      setDismissedAlert(false);
+      await triggerManualIngest();
+      await refetchMap();
+    } catch (err) {
+      console.error('Manual ingest error:', err);
     }
-    fetchDetails()
-  }, [selectedGrid, leadDay])
+  };
+
+  // 10. Dashboard Refresh Handler
+  const handleRefresh = async () => {
+    try {
+      setIsRefreshing(true);
+      await Promise.all([
+        refreshHealth(),
+        refetchMap(),
+        selectedGrid ? refetchTimeseries() : Promise.resolve(),
+        selectedGrid ? refetchExplanation() : Promise.resolve(),
+      ]);
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  const handleSelectGrid = useCallback((gridId) => {
+    setSelectedGrid(gridId);
+  }, []);
+
+  const handleDeselectGrid = useCallback(() => {
+    setSelectedGrid(null);
+    clearSelection();
+  }, [clearSelection]);
+
+  const activeSource = mapData?.metadata?.data_source || (isLiveMode ? 'live' : 'historical');
 
   return (
-    <div className="dashboard">
-      <header className="header">
-        <h1>Forecast Bust Detection</h1>
-        <div className="slider-container">
-          <span className="slider-label">LEAD DAY</span>
-          <input 
-            type="range" 
-            min="1" 
-            max="10" 
-            value={leadDay} 
-            onChange={(e) => setLeadDay(parseInt(e.target.value))}
-          />
-          <span className="slider-value">{leadDay}</span>
-        </div>
-      </header>
+    <div className="dashboard-app">
+      {/* 1. Operational Telemetry Header */}
+      <OperationalHeader
+        health={health}
+        healthLoading={healthLoading}
+        healthError={healthError}
+        isIngesting={ingesting}
+        onIngest={handleIngest}
+        onRefresh={handleRefresh}
+        isRefreshing={isRefreshing}
+      />
 
-      <div className="main-content">
-        <div className="map-panel">
-          <MapContainer center={[23.0, 85.5]} zoom={5} scrollWheelZoom={true} className="map">
-            <TileLayer
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-            />
-            {mapData && (
-              <GeoJSON 
-                key={JSON.stringify(mapData.features[0]?.properties?.grid_id) + leadDay} // force re-render on data change
-                data={mapData}
-                pointToLayer={(feature, latlng) => {
-                  const { confidence_score } = feature.properties;
-                  const color = getColor(confidence_score);
-                  return L.circleMarker(latlng, {
-                    radius: 7,
-                    color: color,
-                    fillColor: color,
-                    fillOpacity: 0.8,
-                    weight: 1
-                  });
-                }}
-                onEachFeature={(feature, layer) => {
-                  const { grid_id, confidence_score } = feature.properties;
-                  layer.on('click', () => setSelectedGrid(grid_id));
-                  layer.bindPopup(`<strong>Grid:</strong> ${grid_id} <br/><strong>Confidence:</strong> ${(confidence_score * 100).toFixed(1)}%`);
-                }}
-              />
-            )}
-          </MapContainer>
-        </div>
+      {/* 2. Forecast Control Strip: Date, Mode, Horizon, D1–D10 */}
+      <DashboardControls
+        coverage={coverage}
+        currentDate={forecastDate}
+        onDateChange={(newDate) => {
+          setForecastDate(newDate);
+          setDismissedAlert(false);
+        }}
+        currentLeadDay={currentLeadDay}
+        supportedLeadDays={supportedLeadDays}
+        onSelectLeadDay={(day) => {
+          setCurrentLeadDay(day);
+          setDismissedAlert(false);
+        }}
+        isLiveMode={isLiveMode}
+      />
 
-        {selectedGrid && (
-          <div className="side-panel">
-            <h2>Grid: {selectedGrid}</h2>
-            
-            {timeseriesData ? (
-              <div className="card">
-                <h3>Confidence Trend</h3>
-                <div className="trend-list">
-                  {timeseriesData.lead_times.map(lt => (
-                    <div key={lt.lead_day} className="trend-item">
-                      <span className="trend-day">Day {lt.lead_day}</span>
-                      <span className="trend-score" style={{ color: getColor(lt.confidence_score) }}>
-                        {(lt.confidence_score * 100).toFixed(0)}%
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : <p className="loading">Loading timeseries...</p>}
-
-            {explanationData ? (
-              <div className="card">
-                <h3>Explanation (Day {leadDay})</h3>
-                
-                <h4>Top Drivers</h4>
-                <div className="driver-list">
-                  {explanationData.top_drivers.map((drv, i) => (
-                    <div key={i} className={`driver-item ${drv.direction}`}>
-                      <span className="driver-feat">{drv.feature}</span>
-                      <span className="driver-val">{drv.contribution > 0 ? '+' : ''}{drv.contribution.toFixed(2)}</span>
-                    </div>
-                  ))}
-                </div>
-
-                <h4>Historical Analogs</h4>
-                <div className="analog-list">
-                  {explanationData.analogs.map((ana, i) => (
-                    <div key={i} className="analog-item">
-                      <div className="analog-header">
-                        <span className="analog-name">{ana.event_name}</span>
-                        <span className="analog-date">{ana.case_date}</span>
-                      </div>
-                      <div className="analog-score">Similarity: {(ana.similarity_score * 100).toFixed(1)}%</div>
-                      <div className="analog-desc">{ana.historical_error_summary}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : <p className="loading">Loading explanation...</p>}
+      {/* Operational Message / Alert Strip */}
+      {(mapError || healthError) && !dismissedAlert && (
+        <div
+          style={{
+            background: 'var(--bg-panel)',
+            borderBottom: '1px solid var(--border-main)',
+            borderLeft: '3px solid var(--warning-amber)',
+            padding: '4px 16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            fontSize: '10px',
+            fontFamily: 'var(--font-mono)',
+            color: 'var(--text-primary)',
+            zIndex: 80,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ color: 'var(--warning-amber)', fontWeight: 700 }}>⚠ OPERATIONAL ALERT:</span>
+            <span>
+              {mapError?.includes('timed out') || healthError?.includes('timed out')
+                ? 'DATA REQUEST DELAY — Confidence field retained from previous state.'
+                : mapError || healthError}
+            </span>
           </div>
-        )}
-      </div>
+          <button
+            onClick={() => setDismissedAlert(true)}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'var(--text-muted)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              padding: '2px',
+            }}
+            title="Dismiss alert"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
+
+      {/* 3. Main Workstation Space: Leaflet Map (Left) + Intelligence Panel (Right) */}
+      <main className="dashboard-main">
+        {/* Leaflet Map: The primary visual hero */}
+        <LeafletConfidenceMap
+          mapData={mapData}
+          loading={mapLoading}
+          stats={stats}
+          getBustColor={getBustColor}
+          selectedGrid={selectedGrid}
+          onSelectGrid={handleSelectGrid}
+          currentLeadDay={currentLeadDay}
+        />
+
+        {/* Intelligence Panel: Independently vertically scrollable */}
+        <IntelligencePanel
+          selectedGrid={selectedGrid}
+          onDeselectGrid={handleDeselectGrid}
+          currentLeadDay={currentLeadDay}
+          featureProps={selectedFeatureProps}
+          explanationData={explanationData}
+          explanationLoading={explanationLoading}
+          explanationError={explanationError}
+          stats={stats}
+          dataSource={activeSource}
+        />
+      </main>
+
+      {/* 4. Full-Width Forecast Horizon Trajectory Timeline */}
+      <ConfidenceTrajectoryBar
+        selectedGrid={selectedGrid}
+        timeseriesData={timeseriesData}
+        loading={timeseriesLoading}
+        error={timeseriesError}
+        currentLeadDay={currentLeadDay}
+        onSelectLeadDay={(day) => {
+          if (supportedLeadDays.includes(day)) {
+            setCurrentLeadDay(day);
+          }
+        }}
+      />
     </div>
-  )
+  );
 }
 
-export default App
+export default App;
