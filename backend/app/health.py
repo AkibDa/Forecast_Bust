@@ -14,7 +14,7 @@ class HealthResponse(BaseModel):
     ingestion_mode: str
     last_success_time: Optional[str]
     last_status: str
-    data_coverage_range: Dict[str, str]
+    data_coverage_range: Dict[str, Any]
     grid_domain: Dict[str, Any]
     supported_lead_days: list = [1]
 
@@ -33,7 +33,7 @@ def get_health() -> HealthResponse:
         ingestion_mode=ingestion_info["mode"],
         last_success_time=ingestion_info["last_success_time"],
         last_status=ingestion_info["last_status"],
-        data_coverage_range=get_coverage(ingestion_info["mode"]),
+        data_coverage_range=get_coverage(),
         grid_domain=DOMAIN,
         supported_lead_days=[1] if ingestion_info["mode"] in ["live", "cache"] else [1,2,3,4,5,6,7,8,9,10]
     )

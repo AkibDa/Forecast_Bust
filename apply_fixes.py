@@ -1,118 +1,87 @@
-# Helper script to perform the code updates
-
 import os
-import re
 
-# 1 & 2. main.py: Model eager load, Date format validation
-main_path = "backend/app/main.py"
-with open(main_path, "r") as f:
-    main_code = f.read()
+# 1. Update feature_provider.py
+with open("backend/app/feature_provider.py", "r") as f:
+    feat = f.read()
 
-main_code = main_code.replace(
-    'def startup_event():\n    try:\n        run_ingestion_pipeline()',
-    'def startup_event():\n    from .model_interface import _load_model\n    _load_model()\n    try:\n        run_ingestion_pipeline()'
-)
-
-# Date validation dependency
-if "from datetime import datetime" not in main_code:
-    main_code = "from datetime import datetime\n" + main_code
-
-# Date validator function
-date_validator = """
-def validate_date(date_str: str):
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=422, detail=f"Invalid date format: {date_str}. Expected YYYY-MM-DD")
-"""
-main_code = main_code.replace('@app.get("/api/v1/health"', date_validator + '\n@app.get("/api/v1/health"')
-
-# Add date validation to endpoints
-main_code = main_code.replace('def confidence_map(forecast_date: str, lead_day: int):', 'def confidence_map(forecast_date: str, lead_day: int):\n    validate_date(forecast_date)')
-main_code = main_code.replace('def timeseries(grid_id: str, forecast_date: str):', 'def timeseries(grid_id: str, forecast_date: str):\n    validate_date(forecast_date)')
-main_code = main_code.replace('def explanation(grid_id: str, forecast_date: str, lead_day: int):', 'def explanation(grid_id: str, forecast_date: str, lead_day: int):\n    validate_date(forecast_date)')
-
-with open(main_path, "w") as f:
-    f.write(main_code)
-
-# 2. Grid validation in feature_provider.py
-feature_path = "backend/app/feature_provider.py"
-with open(feature_path, "r") as f:
-    feat_code = f.read()
-
-# Add coverage function
-coverage_fn = """
-def get_coverage(mode: str):
+# Replace get_coverage
+old_get_coverage = """def get_coverage(mode: str):
     if mode == "historical":
         return {"start": "2023-01-01", "end": "2024-12-31"}
-    return {"start": "2026-09-27", "end": "2026-09-27"}
+    return {"start": "2026-09-27", "end": "2026-09-27"}"""
+new_get_coverage = """def get_coverage(mode: str = None):
+    _load_historical_data()
+    historical_dates = sorted(_tigge_df['init_time'].dt.strftime('%Y-%m-%d').unique().tolist())
+    from .ingestion import status
+    live_cycle = []
+    if status.last_status == "success" and status.mode in ["live", "cache"] and status.last_success_time:
+        if isinstance(status.last_success_time, str):
+            live_cycle = [status.last_success_time.split("T")[0]]
+    if mode == "historical":
+        return historical_dates
+    elif mode == "live":
+        return live_cycle
+    return {"historical": historical_dates, "live": live_cycle}"""
+feat = feat.replace(old_get_coverage, new_get_coverage)
+
+old_404 = """detail=f"Historical data not found for init_time={forecast_date} and lead_day={lead_day}. Available dates range from {_tigge_df['init_time'].min().date()} to {_tigge_df['init_time'].max().date()}""""
+new_404 = """detail=f"Historical data not found for init_time={forecast_date} and lead_day={lead_day}. Available dates: {get_coverage('historical')}""""
+feat = feat.replace(old_404, new_404)
+
+with open("backend/app/feature_provider.py", "w") as f:
+    f.write(feat)
+
+# 2. Update health.py
+with open("backend/app/health.py", "r") as f:
+    health = f.read()
+
+# Replace coverage call
+health = health.replace('from .feature_provider import get_coverage', 'from .feature_provider import get_coverage')
+health = health.replace('data_coverage_range=get_coverage(mode)', 'data_coverage_range=get_coverage()')
+with open("backend/app/health.py", "w") as f:
+    f.write(health)
+
+# 3. Update main.py to add /api/v1/coverage
+with open("backend/app/main.py", "r") as f:
+    main = f.read()
+
+if "/api/v1/coverage" not in main:
+    coverage_endpoint = """
+@app.get("/api/v1/coverage")
+def coverage():
+    from .feature_provider import get_coverage
+    return get_coverage()
 """
-feat_code = feat_code.replace('import os', 'import os\nfrom .config import DOMAIN\n' + coverage_fn)
+    main = main + coverage_endpoint
+with open("backend/app/main.py", "w") as f:
+    f.write(main)
 
-grid_val = """
-    if not (DOMAIN["lat_min"] <= lat <= DOMAIN["lat_max"] and DOMAIN["lon_min"] <= lon <= DOMAIN["lon_max"]):
-        raise ValueError(f"grid_id {grid_id} outside domain bounding box")
+# 4. Update analog_retrieval.py
+with open("backend/app/analog_retrieval.py", "r") as f:
+    analog = f.read()
+
+analog_replacement = """
+    for _, row in top_n.iterrows():
+        case_dt = row['valid_time']
+        if isinstance(case_dt, str):
+            case_date_str = case_dt.split("T")[0]
+        else:
+            case_date_str = case_dt.strftime("%Y-%m-%d")
+
+        # Domain max/mean ERA5 precip and location
+        # Since we just have the row, the "domain" max/mean isn't in this row, but the user says "domain max/mean ERA5 precip and its location"
+        # We need to find the max precip in era5 for that day. 
+        # Actually, let's just use the `error_tp` or `is_bust` from the row as the forecast-error outcome.
+        
+        # Real facts per analog
+        out = {
+            "case_date": case_date_str,
+            "similarity_score": round(row['similarity'], 3),
+            "domain_max_precip": None, # Will fill this
+            "domain_mean_precip": None,
+            "max_precip_location": None,
+            "forecast_error_outcome": f"Bust={row['is_bust']}" if 'is_bust' in row else None
+        }
+        analogs.append(out)
 """
-feat_code = feat_code.replace('lon = float(parts[1])', 'lon = float(parts[1])\n' + grid_val)
-
-# Fix live lead_day validation to throw ValueError formatting supported_lead_days
-feat_code = feat_code.replace(
-    'raise ValueError("supported_lead_days=[1] for live/cache mode in MVP")',
-    'raise ValueError("supported_lead_days=[1]")'
-)
-
-# Fix 404 message to use get_coverage
-feat_code = feat_code.replace(
-    'raise ValueError(f"Historical data not found for init_time={init_time_str} and lead_day={lead_day}. Available dates range from 2023-01-01 to 2024-12-31")',
-    'cov = get_coverage("historical")\n        raise ValueError(f"Historical data not found for init_time={init_time_str} and lead_day={lead_day}. Available dates range from {cov[\'start\']} to {cov[\'end\']}")'
-)
-with open(feature_path, "w") as f:
-    f.write(feat_code)
-
-
-# 1 & 4. health.py: True model loaded state & coverage
-health_path = "backend/app/health.py"
-with open(health_path, "r") as f:
-    health_code = f.read()
-
-health_code = health_code.replace(
-    'from .config import DOMAIN',
-    'from .config import DOMAIN\nfrom .feature_provider import get_coverage'
-)
-health_code = health_code.replace(
-    'data_coverage_range={"start": "2023-01-01", "end": "2026-09-19"},',
-    'data_coverage_range=get_coverage(ingestion_info["mode"]),'
-)
-# Add supported_lead_days
-health_code = health_code.replace(
-    'grid_domain: Dict[str, Any]',
-    'grid_domain: Dict[str, Any]\n    supported_lead_days: list = [1]'
-)
-health_code = health_code.replace(
-    'grid_domain=DOMAIN',
-    'grid_domain=DOMAIN,\n        supported_lead_days=[1] if ingestion_info["mode"] in ["live", "cache"] else [1,2,3,4,5,6,7,8,9,10]'
-)
-with open(health_path, "w") as f:
-    f.write(health_code)
-
-
-# 3. ingestion.py: explicitly filter stepRange=0-24
-ingest_path = "backend/app/ingestion.py"
-with open(ingest_path, "r") as f:
-    ingest_code = f.read()
-
-ingest_code = ingest_code.replace(
-    "ds_list = cfgrib.open_datasets(grib_path)",
-    "ds_list = cfgrib.open_datasets(grib_path, backend_kwargs={'filter_by_keys': {'stepRange': '0-24', 'shortName': 'tp'}})\n    ds_list_others = cfgrib.open_datasets(grib_path, backend_kwargs={'filter_by_keys': {'stepType': 'instant'}})\n    ds_list = ds_list + ds_list_others"
-)
-with open(ingest_path, "w") as f:
-    f.write(ingest_code)
-
-# main.py valueerror mapper to 422 if it's validation
-main_code = open(main_path).read()
-main_code = main_code.replace(
-    'def general_exception_handler(request: Request, exc: Exception):\n    return JSONResponse(\n        status_code=500,',
-    'def general_exception_handler(request: Request, exc: Exception):\n    status_code = 422 if isinstance(exc, ValueError) else 500\n    return JSONResponse(\n        status_code=status_code,'
-)
-with open(main_path, "w") as f:
-    f.write(main_code)
+# wait, actually, to get domain max/mean ERA5 precip and its location, we need era5. Let's do it in the file.

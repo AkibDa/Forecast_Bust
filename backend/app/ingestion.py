@@ -3,8 +3,7 @@ import requests
 import datetime
 from typing import Optional, Dict, Any
 
-# NOMADS GFS filter URL for 0.25 degree resolution
-NOMADS_FILTER_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
+
 
 class IngestionStatus:
     last_success_time: Optional[datetime.datetime] = None
@@ -24,14 +23,18 @@ def download_latest_gfs(lead_hour: int = 24) -> str:
     run_hour = (today.hour // 6) * 6
     date_str = today.strftime("%Y%m%d")
     
-    # Required variables per contract: msl, 10u, 10v, 2t, tp
-    leftlon = 68.0
-    rightlon = 103.0
-    toplat = 38.0
-    bottomlat = 8.0
+    from .config import DOMAIN
+    
+    leftlon = DOMAIN['lon_min']
+    rightlon = DOMAIN['lon_max']
+    toplat = DOMAIN['lat_max']
+    bottomlat = DOMAIN['lat_min']
+
+    res_str = "0p50" if DOMAIN['resolution'] == 0.5 else "0p25"
+    nomads_filter_url = f"https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_{res_str}.pl"
 
     params = {
-        'file': f'gfs.t{run_hour:02d}z.pgrb2.0p25.f{lead_hour:03d}',
+        'file': f'gfs.t{run_hour:02d}z.pgrb2.{res_str}.f{lead_hour:03d}',
         'lev_10_m_above_ground': 'on',
         'lev_2_m_above_ground': 'on',
         'lev_mean_sea_level': 'on',
@@ -51,7 +54,7 @@ def download_latest_gfs(lead_hour: int = 24) -> str:
 
     try:
         print(f"Attempting live NOMADS pull: dir={params['dir']}, file={params['file']}")
-        response = requests.get(NOMADS_FILTER_URL, params=params, timeout=30)
+        response = requests.get(nomads_filter_url, params=params, timeout=30)
         response.raise_for_status()
         
         filepath = f"../model/datasets/gfs_{date_str}_{run_hour:02d}_f{lead_hour:03d}.grb2"

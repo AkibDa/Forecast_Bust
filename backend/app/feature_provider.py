@@ -1,16 +1,28 @@
 import os
-from .config import DOMAIN
 
-def get_coverage(mode: str):
+def get_coverage(mode: str = None):
+    _load_historical_data()
+    historical_dates = sorted(_tigge_df['init_time'].dt.strftime('%Y-%m-%d').unique().tolist())
+    from .ingestion import status
+    live_cycle = []
+    if status.last_status == "success" and status.mode in ["live", "cache"] and status.last_success_time:
+        if isinstance(status.last_success_time, str):
+            live_cycle = [status.last_success_time.split("T")[0]]
+        else:
+            live_cycle = [status.last_success_time.strftime("%Y-%m-%d")]
+    
     if mode == "historical":
-        return {"start": "2023-01-01", "end": "2024-12-31"}
-    return {"start": "2026-09-27", "end": "2026-09-27"}
+        return historical_dates
+    elif mode == "live":
+        return live_cycle
+    return {"historical": historical_dates, "live": live_cycle}
 
 import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, Tuple
 from fastapi import HTTPException
 from .shared_utils import get_month_from_dates
+import numpy as np
 
 BASE_DIR = os.path.dirname(__file__)
 TIGGE_PATH = os.path.join(BASE_DIR, '../../model/datasets/tigge_ncep_2023_2024.parquet')
@@ -24,6 +36,10 @@ def _load_historical_data():
             # Add an init_time column for easier filtering if it doesn't exist
             if 'init_time' not in _tigge_df.columns:
                 _tigge_df['init_time'] = pd.to_datetime(_tigge_df['valid_time']) - pd.to_timedelta(_tigge_df['lead_time_hours'], unit='h')
+            
+            # Apply diff to precipitation so it's 24h instead of accumulated since init
+            _tigge_df = _tigge_df.sort_values(['latitude', 'longitude', 'init_time', 'lead_time_hours'])
+            _tigge_df['precipitation'] = _tigge_df.groupby(['latitude', 'longitude', 'init_time'])['precipitation'].diff().fillna(_tigge_df['precipitation']).clip(lower=0)
         except Exception as e:
             print(f"Failed to load historical TIGGE data: {e}")
             raise HTTPException(status_code=503, detail="Historical database unavailable.")
@@ -48,10 +64,11 @@ def get_forecast_features_batch(forecast_date: str, lead_day: int) -> Tuple[pd.D
     lead_time_hours = lead_day * 24
     forecast_dt = pd.to_datetime(forecast_date)
     
-    # 121x141 grid simulation
-    # Ensure downsampled map grid exactly hits parquet nodes
-    lats = pd.Series([round(x, 2) for x in range(8, 39, 1)])
-    lons = pd.Series([round(x, 2) for x in range(68, 104, 1)])
+    from .config import DOMAIN
+    
+    # 61x71 grid (0.5 degree resolution)
+    lats = pd.Series(np.arange(DOMAIN['lat_min'], DOMAIN['lat_max'] + DOMAIN['resolution'], DOMAIN['resolution']).round(2))
+    lons = pd.Series(np.arange(DOMAIN['lon_min'], DOMAIN['lon_max'] + DOMAIN['resolution'], DOMAIN['resolution']).round(2))
     grid_df = pd.MultiIndex.from_product([lats, lons], names=['latitude', 'longitude']).to_frame(index=False)
     grid_df['init_time'] = forecast_dt
     grid_df['lead_time_hours'] = lead_time_hours
@@ -67,9 +84,10 @@ def get_forecast_features_batch(forecast_date: str, lead_day: int) -> Tuple[pd.D
         ].copy()
         
         if slice_df.empty:
+            historical_cov = get_coverage('historical')
             raise HTTPException(
                 status_code=404, 
-                detail=f"Historical data not found for init_time={forecast_date} and lead_day={lead_day}. Available dates range from {_tigge_df['init_time'].min().date()} to {_tigge_df['init_time'].max().date()}"
+                detail=f"Historical data not found for init_time={forecast_date} and lead_day={lead_day}. Available dates range from {historical_cov[0]} to {historical_cov[-1]}"
             )
             
         slice_df['latitude'] = slice_df['latitude'].round(2)
@@ -87,7 +105,6 @@ def get_forecast_features_batch(forecast_date: str, lead_day: int) -> Tuple[pd.D
     elif mode == "live":
         # Check if live ingestion ran
         from .ingestion import status, process_grib_to_schema
-        import numpy as np
         
         if status.last_status == "success" and status.mode in ["live", "cache"]:
             try:

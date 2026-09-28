@@ -76,6 +76,11 @@ def validate_date(date_str: str):
 def health_check():
     return get_health()
 
+@app.get("/api/v1/coverage")
+def coverage():
+    from .feature_provider import get_coverage
+    return get_coverage()
+
 @app.post("/api/v1/ingest")
 def trigger_ingestion():
     from .ingestion import get_ingestion_status
