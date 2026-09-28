@@ -21,6 +21,12 @@ app.add_middleware(
 def health_check():
     return get_health()
 
+@app.post("/api/v1/ingest")
+def trigger_ingestion():
+    from .ingestion import run_ingestion_pipeline, get_ingestion_status
+    run_ingestion_pipeline()
+    return get_ingestion_status()
+
 @app.get("/api/v1/confidence-map", response_model=Dict[str, Any])
 def confidence_map(forecast_date: str, lead_day: int):
     if lead_day < 1 or lead_day > 10:
