@@ -1,4 +1,11 @@
 import os
+from .config import DOMAIN
+
+def get_coverage(mode: str):
+    if mode == "historical":
+        return {"start": "2023-01-01", "end": "2024-12-31"}
+    return {"start": "2026-09-27", "end": "2026-09-27"}
+
 import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, Tuple
